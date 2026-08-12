@@ -1,0 +1,15 @@
+# generated symlink
+.nix-profile
+/result
+
+# sandbox-home runtime/cache
+sandbox-home/.nix-profile
+sandbox-home/.cache/
+sandbox-home/.npm/
+sandbox-home/.local/
+sandbox-home/.nix-defexpr/
+sandbox-home/.bash_history
+
+# ephemeral sandbox homes (created by start-sandbox.sh)
+sandbox-home-*
+sandbox-home/.pi/agent/.cache/
