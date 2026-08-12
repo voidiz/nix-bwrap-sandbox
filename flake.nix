@@ -27,9 +27,6 @@
         packages = with pkgs; [
           nix
 
-          # Fallback system CA bundle when we can't mount the host one
-          cacert
-
           curl
           git
           jq

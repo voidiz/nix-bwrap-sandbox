@@ -24,10 +24,31 @@ resolve_paths() {
   [[ ! -f "$bash_path" ]] && command -v bash &>/dev/null && bash_path=$(command -v bash)
   [[ ! -f "$bash_path" ]] && [[ -f /bin/sh ]] && bash_path=/bin/sh
 
-  # Mount system CA cert bundle if available. Otherwise we'll automatically
-  # fall back to cacert bundle from nixpkgs
   ssl_cert=""
-  [[ -f /etc/ssl/certs/ca-certificates.crt ]] && ssl_cert=/etc/ssl/certs/ca-certificates.crt
+  local candidate
+  for candidate in \
+    "${NIX_SSL_CERT_FILE:-}" \
+    "${SSL_CERT_FILE:-}" \
+    /etc/ssl/certs/ca-certificates.crt \
+    /etc/ssl/ca-bundle.pem \
+    /etc/ssl/certs/ca-bundle.crt \
+    /etc/pki/tls/certs/ca-bundle.crt \
+    /nix/store/*-nss-cacert-*/etc/ssl/certs/ca-bundle.crt; do
+
+    [[ -z "$candidate" ]] && continue
+
+    candidate="$(readlink -f "$candidate" 2>/dev/null || true)"
+    if [[ -n "$candidate" && -f "$candidate" ]]; then
+      ssl_cert="$candidate"
+      break
+    fi
+  done
+
+  if [[ -z "$ssl_cert" ]]; then
+    echo "error: no CA bundle found; TLS downloads inside the sandbox will fail" >&2
+    echo "         set NIX_SSL_CERT_FILE to your CA bundle and retry" >&2
+    exit 1
+  fi
 
   # script(1) is used below to run nix under a pty from the devtmpfs inside
   # the bwrap
@@ -53,6 +74,20 @@ seed_sandbox_home_dir() {
   cp -a "$real/." "$dest/"
 }
 
+# Copy the single file "$1" (relative to $HOME) into the sandbox home directory
+# while resolving symlinks
+seed_sandbox_home_file() {
+  local rel="$1" src dest
+
+  src="$HOME/$rel"
+  dest="$sandbox_home/$rel"
+
+  [[ -f "$src" ]] || return 1
+
+  mkdir -p "$(dirname "$dest")"
+  cp -pL "$src" "$dest"
+}
+
 # One temporary home directory for each sandbox
 setup_sandbox_home() {
   local script_dir="$1"
@@ -63,16 +98,19 @@ setup_sandbox_home() {
   cp -a "$script_dir/sandbox-home/." "$sandbox_home/" 2>/dev/null || true
   seed_sandbox_home_dir "$HOME/.pi" || true
   seed_sandbox_home_dir "$HOME/.kiro" || true
+
+  # Auth token for kiro
+  seed_sandbox_home_file ".local/share/kiro-cli/data.sqlite3" || true
 }
 
 build_binds() {
   binds=()
 
-  [[ -d /usr/bin ]] && _binds+=(--ro-bind /usr/bin /usr/bin)
-  [[ -d /usr/lib ]] && _binds+=(--ro-bind /usr/lib /usr/lib)
-  [[ -d /usr/lib64 ]] && _binds+=(--ro-bind /usr/lib64 /usr/lib64 --symlink /usr/lib64 /lib64)
-  [[ -n "$ssl_cert" ]] && _binds+=(--ro-bind "$ssl_cert" /etc/ssl/certs/ca-certificates.crt --setenv SSL_CERT_FILE /etc/ssl/certs/ca-certificates.crt --setenv CURL_CA_BUNDLE /etc/ssl/certs/ca-certificates.crt)
-  [[ -n "${XDG_RUNTIME_DIR:-}" ]] && _binds+=(--bind "${XDG_RUNTIME_DIR}" "${XDG_RUNTIME_DIR}" --setenv XDG_RUNTIME_DIR "${XDG_RUNTIME_DIR}")
+  [[ -d /usr/bin ]] && binds+=(--ro-bind /usr/bin /usr/bin)
+  [[ -d /usr/lib ]] && binds+=(--ro-bind /usr/lib /usr/lib)
+  [[ -d /usr/lib64 ]] && binds+=(--ro-bind /usr/lib64 /usr/lib64 --symlink /usr/lib64 /lib64)
+  [[ -n "$ssl_cert" ]] && binds+=(--ro-bind "$ssl_cert" /etc/ssl/certs/ca-certificates.crt --setenv SSL_CERT_FILE /etc/ssl/certs/ca-certificates.crt --setenv CURL_CA_BUNDLE /etc/ssl/certs/ca-certificates.crt)
+  [[ -n "${XDG_RUNTIME_DIR:-}" ]] && binds+=(--bind "${XDG_RUNTIME_DIR}" "${XDG_RUNTIME_DIR}" --setenv XDG_RUNTIME_DIR "${XDG_RUNTIME_DIR}")
 }
 
 main() {

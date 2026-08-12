@@ -3,13 +3,13 @@
 ## requirements
 
 - [bubblewrap](https://github.com/containers/bubblewrap)
-- nix with `nix-command` and `flakes` features enabled
+- nix with `nix-command` and `flakes` features
 - `script(1)`
 
 ## usage
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/voidiz/nix-bwrap-sandbox/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/voidiz/nix-bwrap-sandbox/master/install.sh | bash
 
 bwrap-sandbox
 ```
