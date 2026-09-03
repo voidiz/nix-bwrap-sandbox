@@ -28,3 +28,4 @@ case "$TERM" in
 esac
 
 alias grep='grep --color=auto'
+alias vim='nvim'
