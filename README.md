@@ -4,7 +4,6 @@
 
 - [bubblewrap](https://github.com/containers/bubblewrap)
 - nix with `nix-command` and `flakes` features
-- `script(1)`
 
 ## usage
 

@@ -1,30 +1,49 @@
 #!/usr/bin/env bash
 
+# Usage:
+#
+# Interactive shell:
+# ./bwrap-sandbox.sh
+#
+# Run command inside sandbox:
+# ./bwrap-sandbox.sh -- echo "hi"
+#
+# Pass additional flags to bwrap
+# ./bwrap-sandbox --ro-bind /example /example
+
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 
-check_dependencies() {
-  local missing=()
-  local bin
-  for bin in bwrap nix script; do
-    command -v "$bin" >/dev/null 2>&1 || missing+=("$bin")
-  done
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
 
-  if [[ ${#missing[@]} -gt 0 ]]; then
-    echo "missing required binaries: ${missing[*]}" >&2
-    exit 1
-  fi
+check_host_dependencies() {
+  command -v nix >/dev/null 2>&1 || die "nix not found on PATH"
+}
+
+enter_devshell() {
+  # Re-execute this script inside the devshell. The env variable puts us in the
+  # second phase of the script which starts the bwrap.
+  exec nix --extra-experimental-features "nix-command flakes" develop \
+    --accept-flake-config "$script_dir" \
+    --command env BWRAP_SANDBOX_IN_DEVSHELL=1 "$0" "$@"
+}
+
+check_sandbox_dependencies() {
+  command -v bwrap >/dev/null 2>&1 || die "bwrap not found on PATH"
 }
 
 resolve_paths() {
-  nix_bin=$(readlink -f "$(command -v nix)")
+  bash_path="$(readlink -f "$(command -v bash)")"
 
-  bash_path="/bin/bash"
-  [[ ! -f "$bash_path" ]] && command -v bash &>/dev/null && bash_path=$(command -v bash)
-  [[ ! -f "$bash_path" ]] && [[ -f /bin/sh ]] && bash_path=/bin/sh
+  script_bin="$(command -v script 2>/dev/null || true)"
+  script_bin="$(readlink -f "$script_bin")"
 
   ssl_cert=""
+
   local candidate
   for candidate in \
     "${NIX_SSL_CERT_FILE:-}" \
@@ -45,16 +64,7 @@ resolve_paths() {
   done
 
   if [[ -z "$ssl_cert" ]]; then
-    echo "error: no CA bundle found; TLS downloads inside the sandbox will fail" >&2
-    echo "         set NIX_SSL_CERT_FILE to your CA bundle and retry" >&2
-    exit 1
-  fi
-
-  # script(1) is used below to run nix under a pty from the devtmpfs inside
-  # the bwrap
-  script_bin=$(command -v script 2>/dev/null || true)
-  if [[ -n "$script_bin" ]]; then
-    script_bin=$(readlink -f "$script_bin")
+    die "no CA bundle found, set SSL_CERT_FILE to your CA bundle and retry"
   fi
 }
 
@@ -110,11 +120,41 @@ build_binds() {
   [[ -d /usr/lib ]] && binds+=(--ro-bind /usr/lib /usr/lib)
   [[ -d /usr/lib64 ]] && binds+=(--ro-bind /usr/lib64 /usr/lib64 --symlink /usr/lib64 /lib64)
   [[ -n "$ssl_cert" ]] && binds+=(--ro-bind "$ssl_cert" /etc/ssl/certs/ca-certificates.crt --setenv SSL_CERT_FILE /etc/ssl/certs/ca-certificates.crt --setenv CURL_CA_BUNDLE /etc/ssl/certs/ca-certificates.crt)
-  [[ -n "${XDG_RUNTIME_DIR:-}" ]] && binds+=(--bind "${XDG_RUNTIME_DIR}" "${XDG_RUNTIME_DIR}" --setenv XDG_RUNTIME_DIR "${XDG_RUNTIME_DIR}")
+}
+
+build_sandbox_path() {
+  local entries entry
+  local kept=""
+
+  # Filter for only PATH entries added by `nix develop`
+  IFS=':' read -ra entries <<< "$PATH"
+  for entry in "${entries[@]}"; do
+    if [[ "$entry" == /nix/store/* ]]; then
+      kept="$kept$entry:"
+    fi
+  done
+
+  echo "${kept}/bin:/usr/bin"
+}
+
+build_sandbox_env() {
+  sandbox_env=()
+
+  sandbox_env+=(--setenv PATH "$(build_sandbox_path)")
+  sandbox_env+=(--setenv SHELL "${SHELL:-/bin/bash}")
+  sandbox_env+=(--setenv HOME "$sandbox_home")
+  sandbox_env+=(--setenv TMPDIR /tmp)
+  sandbox_env+=(--setenv TERM "${TERM:-xterm-256color}")
+  [[ -n "${NIX_PATH:-}" ]] && sandbox_env+=(--setenv NIX_PATH "$NIX_PATH")
 }
 
 main() {
-  check_dependencies
+  if [[ -z "${BWRAP_SANDBOX_IN_DEVSHELL:-}" ]]; then
+    check_host_dependencies
+    enter_devshell "$@"
+  fi
+
+  check_sandbox_dependencies
   resolve_paths
 
   sandbox_passwd=$(mktemp /tmp/sandbox-passwd-XXXXXX)
@@ -122,7 +162,15 @@ main() {
 
   cleanup() {
     rm -f "$sandbox_passwd" "$sandbox_group"
-    [[ -n "${sandbox_home:-}" ]] && rm -rf "$sandbox_home"
+    if [[ -n "${sandbox_home:-}" ]]; then
+      rm -rf "$sandbox_home" 2>/dev/null || {
+        # nix run/shell/build inside the sandbox leaves a chroot store with
+        # read-only permissions under the sandbox HOME. Make it writable and
+        # retry
+        chmod -R u+w "$sandbox_home"
+        rm -rf "$sandbox_home"
+      }
+    fi
   }
   trap cleanup EXIT
 
@@ -136,52 +184,57 @@ main() {
   echo "nixuser:x:${host_gid}:" >>"$sandbox_group"
 
   build_binds
+  build_sandbox_env
 
-  # Activate the devshell when entering the bwrap, and forward the positional
-  # args passed to this script or fall back to bash
-  local nix_cmd
-  nix_cmd=$(printf "%q " "$nix_bin" --extra-experimental-features "nix-command flakes" develop --accept-flake-config "$script_dir" -c "${@:-bash}")
+  local -a extra_flags=()
+  if [[ "${1:-}" == "--" ]]; then
+    shift
+  elif [[ "${1:-}" == -* ]]; then
+    while [[ $# -gt 0 && "$1" != "--" ]]; do
+      extra_flags+=("$1")
+      shift
+    done
+    if [[ "${1:-}" == "--" ]]; then
+      shift
+    fi
+  fi
+
+  # Default to $SHELL (with /bin/bash fallback) if no command was passed
+  local -a cmd
+  if [[ $# -eq 0 ]]; then
+    cmd=("${SHELL:-/bin/bash}" -i)
+  else
+    cmd=("$@")
+  fi
+  local inner_cmd
+  inner_cmd="$(printf "%q " "${cmd[@]}")"
 
   bwrap \
     --clearenv \
+    --unshare-all \
     --share-net \
-    --unshare-pid \
     --die-with-parent \
     --new-session \
-    --unshare-uts \
-    --bind /nix/store /nix/store \
-    --bind /nix/var/nix /nix/var/nix \
-    --tmpfs /nix/var/nix/builds \
+    --ro-bind /nix/store /nix/store \
     --ro-bind-try /bin/sh /bin/sh \
     --ro-bind "$bash_path" /bin/bash \
-    --ro-bind "$nix_bin" /usr/bin/nix \
     "${binds[@]}" \
     --ro-bind /etc/resolv.conf /etc/resolv.conf \
     --ro-bind /etc/hosts /etc/hosts \
     --ro-bind /etc/nsswitch.conf /etc/nsswitch.conf \
+    --ro-bind-try /etc/localtime /etc/localtime \
     --ro-bind "$sandbox_passwd" /etc/passwd \
     --ro-bind "$sandbox_group" /etc/group \
-    --ro-bind-try /etc/ld.so.cache /etc/ld.so.cache \
     --bind "$PWD" "$PWD" \
     --bind "$script_dir" "$script_dir" \
     --tmpfs /tmp \
     --proc /proc \
     --dev /dev \
     --tmpfs /dev/shm \
-    --ro-bind-try /sys /sys \
-    --ro-bind-try /etc/machine-id /etc/machine-id \
-    --ro-bind-try /var/lib/dbus/machine-id /var/lib/dbus/machine-id \
-    --ro-bind-try /run/dbus/system_bus_socket /run/dbus/system_bus_socket \
-    \
-    --ro-bind-try /etc/localtime /etc/localtime \
-    --ro-bind-try /etc/hostname /etc/hostname \
-    \
-    --setenv HOME "$sandbox_home" \
-    --setenv PATH "/bin:/usr/bin" \
-    --setenv TMPDIR /tmp \
-    --setenv TERM "${TERM:-xterm-256color}" \
+    "${extra_flags[@]}" \
+    "${sandbox_env[@]}" \
     --chdir "$PWD" \
-    "${script_bin:-script}" -qec "$nix_cmd" /dev/null
+    "$script_bin" -qec "$inner_cmd" /dev/null
 }
 
 main "$@"

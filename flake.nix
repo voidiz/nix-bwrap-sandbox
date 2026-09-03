@@ -25,6 +25,22 @@
 
         # Base packages for the sandbox
         packages = with pkgs; [
+          # Subset of NixOS `environment.corePackages`
+          # (nixos/modules/config/system-path.nix)
+          gnugrep
+          gnused
+          gawk
+          findutils
+          diffutils
+          gnupatch
+          gnutar
+          gzip
+          bzip2
+          xz
+          zstd
+          util-linux
+          time
+
           nix
 
           curl
@@ -35,17 +51,19 @@
           less
           fd
           ripgrep
-          # ps, etc.
           procps
           unzip
           which
           htop
 
+          uv
+          nodejs
+          python3
+
           pi-coding-agent
           kiro-cli
 
           bash-completion
-          bashInteractive
         ];
 
         shellHook = ''
