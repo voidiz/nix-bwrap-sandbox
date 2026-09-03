@@ -35,7 +35,7 @@
     apps = forAllSystems (system: let
       pkg = self.packages.${system}.bwrap-sandbox;
     in {
-      nbs = {
+      bwrap-sandbox = {
         type = "app";
         program = "${pkg}/bin/bwrap-sandbox";
       };
