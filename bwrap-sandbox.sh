@@ -14,6 +14,7 @@
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+flake_dir="${BWRAP_SANDBOX_FLAKE_DIR:-$script_dir}"
 
 die() {
   echo "error: $*" >&2
@@ -25,10 +26,25 @@ check_host_dependencies() {
 }
 
 enter_devshell() {
+  # Can't use nix develop on flake inside /nix/store, so copy it out if this
+  # script was installed using nix
+  local flake_ref="$flake_dir"
+  if [[ "$flake_dir" == /nix/store/* ]]; then
+    local key cache_dir
+    key="$(printf '%s' "$flake_dir" | sha256sum | cut -d' ' -f1)"
+    cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/nix-bwrap-sandbox/flakes/$key"
+    rm -rf "$cache_dir"
+
+    mkdir -p "$(dirname "$cache_dir")"
+    cp -r "$flake_dir" "$cache_dir"
+    chmod -R u+w "$cache_dir"
+    flake_ref="$cache_dir"
+  fi
+
   # Re-execute this script inside the devshell. The env variable puts us in the
   # second phase of the script which starts the bwrap.
   exec nix --extra-experimental-features "nix-command flakes" develop \
-    --accept-flake-config "$script_dir" \
+    --accept-flake-config "$flake_ref" \
     --command env BWRAP_SANDBOX_IN_DEVSHELL=1 "$0" "$@"
 }
 
@@ -102,10 +118,11 @@ seed_sandbox_home_file() {
 setup_sandbox_home() {
   local script_dir="$1"
 
-  sandbox_home="$(mktemp -d "$script_dir/sandbox-home-XXXXXX")"
+  sandbox_home="$(mktemp -d "${TMPDIR:-/tmp}/sandbox-home-XXXXXX")"
 
   # Copy over configuration files
   cp -a "$script_dir/sandbox-home/." "$sandbox_home/" 2>/dev/null || true
+  chmod u+w "$sandbox_home"
   seed_sandbox_home_dir "$HOME/.pi" || true
   seed_sandbox_home_dir "$HOME/.kiro" || true
 
@@ -174,7 +191,7 @@ main() {
   }
   trap cleanup EXIT
 
-  setup_sandbox_home "$script_dir"
+  setup_sandbox_home "$flake_dir"
 
   local host_uid host_gid
   host_uid="$(id -u)"
@@ -225,12 +242,12 @@ main() {
     --ro-bind-try /etc/localtime /etc/localtime \
     --ro-bind "$sandbox_passwd" /etc/passwd \
     --ro-bind "$sandbox_group" /etc/group \
-    --bind "$PWD" "$PWD" \
-    --bind "$script_dir" "$script_dir" \
     --tmpfs /tmp \
     --proc /proc \
     --dev /dev \
     --tmpfs /dev/shm \
+    --bind "$PWD" "$PWD" \
+    --bind "$sandbox_home" "$sandbox_home" \
     "${extra_flags[@]}" \
     "${sandbox_env[@]}" \
     --chdir "$PWD" \
